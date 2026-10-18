@@ -197,8 +197,6 @@ function stop() {
 
 function updatePlayhead() {
   if (!state.playing) return;
-  const elapsed = ctx.currentTime - (state.nextStepTime - (state.step * (60 / state.bpm / 4)));
-  // Approximate current bar from clock
   const stepDur = 60 / state.bpm / 4;
   const approxStep = Math.floor((ctx.currentTime - 0.1) / stepDur) % (TOTAL_BARS * STEPS_PER_BAR);
   state.bar = Math.floor(approxStep / STEPS_PER_BAR);
@@ -253,25 +251,115 @@ async function exportWav(withTail = false) {
   const bars = TOTAL_BARS;
   const bpm = state.bpm;
   const length = Math.round(bars * 4 * 60 / bpm * sampleRate);
-  const offline = new OfflineAudioContext(2, length + sampleRate * 2, sampleRate); // extra for tail
-  // Simplified render: schedule all steps from 0
-  // For MVP, note that full offline render would decode rawBuffers into offline context and schedule similarly.
-  // Peak normalize to -1 dBFS, fold tail.
-  alert(`Export length at ${bpm} BPM, ${bars} bars, ${sampleRate} Hz: ${length} samples. First transient at sample 0. (Full offline render implemented in production build.)`);
-  // Placeholder download of silent WAV for structure
-  const buffer = offline.createBuffer(2, length, sampleRate);
-  // ... render logic would go here using state.rawBuffers
-  const wav = encodeWAV(buffer);
+  const tailSamples = sampleRate * 2;
+  const offline = new OfflineAudioContext(2, length + tailSamples, sampleRate);
+
+  const offlineBuffers = {};
+  for (const [k, ab] of Object.entries(state.rawBuffers)) {
+    try {
+      offlineBuffers[k] = await offline.decodeAudioData(ab.slice(0));
+    } catch (e) { console.warn("Offline decode failed", k); }
+  }
+
+  const offlineMaster = offline.createGain();
+  offlineMaster.gain.value = 0.7;
+  const offlineComp = offline.createDynamicsCompressor();
+  offlineComp.threshold.value = -12;
+  offlineComp.ratio.value = 20;
+  offlineMaster.connect(offlineComp);
+  offlineComp.connect(offline.destination);
+
+  function playOffline(name, when, rate = 1, gain = 0.4, duration = 0.2) {
+    if (!offlineBuffers[name]) return;
+    const src = offline.createBufferSource();
+    src.buffer = offlineBuffers[name];
+    src.playbackRate.value = rate;
+    const g = offline.createGain();
+    g.gain.setValueAtTime(0, when);
+    g.gain.linearRampToValueAtTime(gain, when + 0.01);
+    g.gain.setValueAtTime(gain, when + Math.max(0.05, duration - 0.02));
+    g.gain.linearRampToValueAtTime(0, when + duration);
+    src.connect(g);
+    g.connect(offlineMaster);
+    src.start(when);
+    src.stop(when + duration + 0.05);
+  }
+
+  let nextTime = 0;
+  const stepDur = 60 / bpm / 4;
+  for (let step = 0; step < bars * STEPS_PER_BAR; step++) {
+    const barIndex = Math.floor(step / STEPS_PER_BAR) % bars;
+    const s = step % STEPS_PER_BAR;
+    const ch = chordAt(barIndex);
+    const z = zone(barIndex);
+    const rec = state.recipe.id;
+    const onSpace = z === "space";
+
+    if (s % 2 === 0) {
+      const hatGain = onSpace && rec === "hats-off" ? 0 : 0.07;
+      if (hatGain > 0) playOffline("hat", nextTime, 1, hatGain, 0.15);
+    }
+    if (s === 0) playOffline("kick", nextTime, 1, onSpace && rec === "kit-thin" ? 0.5 : 0.7, 0.3);
+    if (s === 8 && !(onSpace && rec === "stop-space" && barIndex === 6)) playOffline("snare", nextTime, 1, onSpace ? 0.3 : 0.45, 0.25);
+
+    if (onSpace && rec === "stop-space" && barIndex === 6 && s < 12) { nextTime += stepDur; continue; }
+
+    if (s === 0) {
+      let bassMidi = ch.bass;
+      playOffline("bA1", nextTime, rateFromMidi(bassMidi, 33), onSpace && rec === "one-chair" ? 0.5 : 0.45, onSpace && rec === "bass-pedal" ? 1.8 : 0.4);
+    }
+    if (s === 0 && !(onSpace && rec === "one-chair")) {
+      playOffline("pC4", nextTime, rateFromMidi(ch.piano[2] || 60, 60), onSpace ? 0.18 : 0.28, 0.5);
+      playOffline("pA3", nextTime, rateFromMidi(ch.piano[1] || 57, 57), 0.16, 0.5);
+    }
+    if (s === 0 && !(onSpace && (rec === "one-chair" || rec === "bass-pedal"))) {
+      playOffline("gA2", nextTime, rateFromMidi(ch.guitar[0] || 45, 45), onSpace && rec === "nylon-sparse" ? 0.15 : 0.22, 0.35);
+    }
+    if (onSpace && rec === "nylon-sparse" && s === 8) playOffline("gE3", nextTime, rateFromMidi((ch.guitar[1] || 52) + 1, 52), 0.2, 0.2);
+    if (onSpace && rec === "violin-hold" && s === 0) {
+      playOffline("vA3", nextTime, rateFromMidi(ch.piano[2] || 60, 57), 0.25, 3.5);
+    }
+    if (onSpace && rec === "trumpet-door" && barIndex === 7 && s === 14) {
+      playOffline("tC4", nextTime, rateFromMidi(ch.piano[3] || 69, 60), 0.38, 0.4);
+    }
+    nextTime += stepDur;
+  }
+
+  const rendered = await offline.startRendering();
+  const dataL = rendered.getChannelData(0);
+  const dataR = rendered.getChannelData(1);
+  if (!withTail) {
+    for (let i = 0; i < Math.min(tailSamples, length); i++) {
+      dataL[i] += dataL[length + i] || 0;
+      dataR[i] += dataR[length + i] || 0;
+    }
+  }
+  let peak = 0;
+  const checkLen = withTail ? rendered.length : length;
+  for (let i = 0; i < checkLen; i++) {
+    peak = Math.max(peak, Math.abs(dataL[i]), Math.abs(dataR[i]));
+  }
+  const scale = peak > 0 ? (Math.pow(10, -1/20) / peak) : 1;
+  for (let i = 0; i < checkLen; i++) {
+    dataL[i] *= scale;
+    dataR[i] *= scale;
+  }
+
+  const outLength = withTail ? rendered.length : length;
+  const outBuffer = offline.createBuffer(2, outLength, sampleRate);
+  outBuffer.copyToChannel(dataL.subarray(0, outLength), 0);
+  outBuffer.copyToChannel(dataR.subarray(0, outLength), 1);
+
+  const wav = encodeWAV(outBuffer);
   const blob = new Blob([wav], { type: "audio/wav" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `spacefour-${state.recipe.id}-${bpm}bpm-${state.key.replace(" ", "")}.wav`;
+  a.download = `spacefour-${state.recipe.id}-${bpm}bpm-${state.key.replace(/ /g, "")}${withTail ? "-withtail" : ""}.wav`;
   a.click();
 }
 
 function encodeWAV(buffer) {
-  // Basic 24-bit WAV encoder stub
-  const numChannels = 2;
+  const numChannels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
   const length = buffer.length;
   const bytesPerSample = 3;
@@ -280,13 +368,84 @@ function encodeWAV(buffer) {
   const dataSize = length * blockAlign;
   const bufferOut = new ArrayBuffer(44 + dataSize);
   const view = new DataView(bufferOut);
-  // RIFF header etc. — full impl in ship
+
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 24, true);
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  const channels = [];
+  for (let c = 0; c < numChannels; c++) channels.push(buffer.getChannelData(c));
+  for (let i = 0; i < length; i++) {
+    for (let c = 0; c < numChannels; c++) {
+      let sample = Math.max(-1, Math.min(1, channels[c][i]));
+      sample = Math.floor(sample * 0x7FFFFF);
+      view.setUint8(offset, sample & 0xFF);
+      view.setUint8(offset + 1, (sample >> 8) & 0xFF);
+      view.setUint8(offset + 2, (sample >> 16) & 0xFF);
+      offset += 3;
+    }
+  }
   return bufferOut;
 }
 
-// MIDI export stub
+function writeString(view, offset, string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
 function exportMidi() {
-  alert("MIDI export: one track per chair, tempo set, downbeat at tick 0. (Full SMF writer in production build.)");
+  const bpm = state.bpm;
+  const ppq = 480;
+  const bars = TOTAL_BARS;
+  const ticksPerBar = ppq * 4;
+
+  function midiFile(tracks) {
+    const header = new Uint8Array([0x4D,0x54,0x68,0x64, 0,0,0,6, 0,1, 0,tracks.length, (ppq>>8)&0xFF, ppq&0xFF]);
+    let data = header;
+    tracks.forEach(t => {
+      const trackData = new Uint8Array(t);
+      const len = trackData.length;
+      const chunk = new Uint8Array(8 + len);
+      chunk.set([0x4D,0x54,0x72,0x6B, (len>>24)&0xFF, (len>>16)&0xFF, (len>>8)&0xFF, len&0xFF], 0);
+      chunk.set(trackData, 8);
+      const merged = new Uint8Array(data.length + chunk.length);
+      merged.set(data); merged.set(chunk, data.length);
+      data = merged;
+    });
+    return data;
+  }
+
+  const usPerQuarter = Math.round(60000000 / bpm);
+  const tempoTrack = [
+    0x00, 0xFF, 0x51, 0x03, (usPerQuarter>>16)&0xFF, (usPerQuarter>>8)&0xFF, usPerQuarter&0xFF,
+    0x00, 0xFF, 0x2F, 0x00
+  ];
+
+  const noteTrack = [0x00, 0xC0, 0x00];
+  for (let b = 0; b < bars; b++) {
+    const delta = b === 0 ? 0 : ticksPerBar;
+    noteTrack.push((delta >> 8) & 0xFF, delta & 0xFF, 0x90, 36, 100);
+    noteTrack.push(0x00, 0x80, 36, 0);
+  }
+  noteTrack.push(0x00, 0xFF, 0x2F, 0x00);
+
+  const blob = new Blob([midiFile([tempoTrack, noteTrack])], { type: "audio/midi" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `spacefour-${state.recipe.id}-${bpm}bpm-${state.key.replace(/ /g, "")}.mid`;
+  a.click();
 }
 
 document.getElementById("playA").onclick = () => start("loop");
@@ -316,7 +475,6 @@ async function init() {
   compressor.connect(ctx.destination);
   await loadSamples();
   render();
-  // Persist
   const saved = localStorage.getItem("spacefour");
   if (saved) {
     const p = JSON.parse(saved);
